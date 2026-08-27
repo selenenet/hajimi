@@ -20,7 +20,15 @@ class ContentPartText(BaseModel):
 
 class OpenAIMessage(BaseModel):
     role: str
-    content: Union[str, List[Union[ContentPartText, ContentPartImage, Dict[str, Any]]]]
+    content: Optional[
+        Union[str, List[Union[ContentPartText, ContentPartImage, Dict[str, Any]]]]
+    ] = None
+    name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+
+    # Tool messages and newer OpenAI clients may attach provider-specific fields.
+    model_config = ConfigDict(extra="allow")
 
 
 class OpenAIRequest(BaseModel):
@@ -38,6 +46,11 @@ class OpenAIRequest(BaseModel):
     logprobs: Optional[int] = None
     response_logprobs: Optional[bool] = None
     n: Optional[int] = None  # Maps to candidate_count in Vertex AI
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None
+    parallel_tool_calls: Optional[bool] = None
+    functions: Optional[List[Dict[str, Any]]] = None
+    function_call: Optional[Any] = None
 
     # Allow extra fields to pass through without causing validation errors
     model_config = ConfigDict(extra="allow")

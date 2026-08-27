@@ -2,12 +2,14 @@ import json
 import time
 import math
 import asyncio
+import re
 from typing import List, Dict, Any, Callable, Union, Optional
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from google.genai import types
 from app.vertex.message_processing import (
     parse_gemini_response_for_reasoning_and_content,
+    extract_gemini_tool_calls,
 )
 
 # Local module imports
@@ -35,6 +37,192 @@ def create_openai_error_response(
     }
 
 
+_FUNCTION_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+
+
+def _resolve_local_schema_ref(ref: str, root: Dict[str, Any]) -> Dict[str, Any]:
+    if not ref.startswith("#/"):
+        return {}
+    current: Any = root
+    for segment in ref[2:].split("/"):
+        segment = segment.replace("~1", "/").replace("~0", "~")
+        if not isinstance(current, dict) or segment not in current:
+            return {}
+        current = current[segment]
+    return current if isinstance(current, dict) else {}
+
+
+def _sanitize_json_schema(
+    schema: Any,
+    root: Optional[Dict[str, Any]] = None,
+    seen_refs: Optional[set] = None,
+) -> Dict[str, Any]:
+    """Convert common OpenAI JSON Schema into google-genai 1.11 Schema."""
+    if not isinstance(schema, dict):
+        return {"type": "OBJECT", "properties": {}}
+    if root is None:
+        root = schema
+    if seen_refs is None:
+        seen_refs = set()
+
+    if "$ref" in schema:
+        ref = str(schema["$ref"])
+        if ref in seen_refs:
+            return {"type": "OBJECT", "properties": {}}
+        resolved = _resolve_local_schema_ref(ref, root)
+        if resolved:
+            return _sanitize_json_schema(resolved, root, seen_refs | {ref})
+
+    working = dict(schema)
+    all_of = working.pop("allOf", None)
+    if isinstance(all_of, list):
+        merged_properties = dict(working.get("properties") or {})
+        merged_required = list(working.get("required") or [])
+        for item in all_of:
+            normalized_item = _sanitize_json_schema(item, root, seen_refs)
+            merged_properties.update(normalized_item.get("properties") or {})
+            for required_name in normalized_item.get("required") or []:
+                if required_name not in merged_required:
+                    merged_required.append(required_name)
+            for key, value in normalized_item.items():
+                working.setdefault(key, value)
+        if merged_properties:
+            working["properties"] = merged_properties
+        if merged_required:
+            working["required"] = merged_required
+
+    result: Dict[str, Any] = {}
+    schema_type = working.get("type")
+    nullable = bool(working.get("nullable", False))
+    if isinstance(schema_type, list):
+        nullable = nullable or "null" in schema_type
+        schema_type = next((item for item in schema_type if item != "null"), None)
+    if schema_type:
+        result["type"] = str(schema_type).upper()
+    elif "properties" in working:
+        result["type"] = "OBJECT"
+    elif "items" in working:
+        result["type"] = "ARRAY"
+
+    for key in (
+        "description",
+        "title",
+        "format",
+        "pattern",
+        "default",
+        "minimum",
+        "maximum",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "minProperties",
+        "maxProperties",
+    ):
+        if key in working and working[key] is not None:
+            result[key] = working[key]
+
+    if nullable:
+        result["nullable"] = True
+    if "const" in working and "enum" not in working:
+        working["enum"] = [working["const"]]
+    if isinstance(working.get("enum"), list):
+        result["enum"] = [str(value) for value in working["enum"]]
+    if isinstance(working.get("properties"), dict):
+        result["properties"] = {
+            str(name): _sanitize_json_schema(value, root, seen_refs)
+            for name, value in working["properties"].items()
+            if isinstance(value, dict)
+        }
+    if isinstance(working.get("required"), list):
+        result["required"] = [str(name) for name in working["required"]]
+    if isinstance(working.get("items"), dict):
+        result["items"] = _sanitize_json_schema(working["items"], root, seen_refs)
+
+    any_of = working.get("anyOf") or working.get("oneOf")
+    if isinstance(any_of, list):
+        normalized_any_of = []
+        for item in any_of:
+            if isinstance(item, dict) and item.get("type") == "null":
+                result["nullable"] = True
+                continue
+            normalized_any_of.append(_sanitize_json_schema(item, root, seen_refs))
+        if normalized_any_of:
+            result["anyOf"] = normalized_any_of
+
+    if "type" not in result and "anyOf" not in result:
+        result["type"] = "OBJECT"
+        result.setdefault("properties", {})
+    return result
+
+
+def _openai_tools_to_gemini(request: OpenAIRequest):
+    raw_tools = list(request.tools or [])
+    if not raw_tools and request.functions:
+        raw_tools = [
+            {"type": "function", "function": function}
+            for function in request.functions
+        ]
+    if not raw_tools:
+        return None, None
+
+    declarations = []
+    declared_names = []
+    for raw_tool in raw_tools:
+        if not isinstance(raw_tool, dict) or raw_tool.get("type", "function") != "function":
+            continue
+        function = raw_tool.get("function") or {}
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "")
+        if not _FUNCTION_NAME_PATTERN.fullmatch(name):
+            raise ValueError(
+                f"Invalid function name '{name}'. Gemini function names must start with a letter or underscore, "
+                "contain only letters, digits, underscores, dots or dashes, and be at most 64 characters."
+            )
+        parameters = _sanitize_json_schema(
+            function.get("parameters") or {"type": "object", "properties": {}}
+        )
+        declarations.append(
+            types.FunctionDeclaration(
+                name=name,
+                description=str(function.get("description") or ""),
+                parameters=types.Schema.model_validate(parameters),
+            )
+        )
+        declared_names.append(name)
+
+    if not declarations:
+        return None, None
+
+    tool_choice = request.tool_choice
+    if tool_choice is None and request.function_call is not None:
+        tool_choice = request.function_call
+    mode = "AUTO"
+    allowed_function_names = None
+    if isinstance(tool_choice, str):
+        mode = {"none": "NONE", "required": "ANY", "auto": "AUTO"}.get(
+            tool_choice.lower(), "AUTO"
+        )
+    elif isinstance(tool_choice, dict):
+        function_choice = tool_choice.get("function") or tool_choice
+        chosen_name = (
+            function_choice.get("name") if isinstance(function_choice, dict) else None
+        )
+        if chosen_name:
+            if chosen_name not in declared_names:
+                raise ValueError(f"tool_choice references undeclared function '{chosen_name}'.")
+            mode = "ANY"
+            allowed_function_names = [chosen_name]
+
+    tool_config = types.ToolConfig(
+        function_calling_config=types.FunctionCallingConfig(
+            mode=mode, allowed_function_names=allowed_function_names
+        )
+    )
+    return types.Tool(function_declarations=declarations), tool_config
+
+
 def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     config = {}
     if request.temperature is not None:
@@ -55,6 +243,13 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         config["frequency_penalty"] = request.frequency_penalty
     if request.n is not None:
         config["candidate_count"] = request.n
+    gemini_tool, tool_config = _openai_tools_to_gemini(request)
+    if gemini_tool is not None:
+        config["tools"] = [gemini_tool]
+        config["tool_config"] = tool_config
+        config["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
+            disable=True
+        )
     config["safety_settings"] = [
         types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
         types.SafetySetting(
@@ -99,6 +294,10 @@ def is_response_valid(response):
                 and candidate.content.parts
             ):
                 for part in candidate.content.parts:
+                    if getattr(part, "function_call", None) and getattr(
+                        part.function_call, "name", None
+                    ):
+                        return True
                     if (
                         hasattr(part, "text")
                         and isinstance(part.text, str)
@@ -128,6 +327,7 @@ async def _base_fake_stream_engine(
     check_block_reason_func: Optional[Callable[[Any], None]] = None,
     reasoning_text_to_yield: Optional[str] = None,
     actual_content_text_to_yield: Optional[str] = None,
+    tool_calls_to_yield: Optional[List[Dict[str, Any]]] = None,
 ):
     api_call_task = api_call_task_creator()
 
@@ -200,12 +400,32 @@ async def _base_fake_stream_engine(
             if final_actual_content_text:
                 await asyncio.sleep(0.05)
 
+        if tool_calls_to_yield:
+            tool_call_delta = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": sse_model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": tool_calls_to_yield,
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(tool_call_delta, ensure_ascii=False)}\n\n"
+
         content_to_chunk = final_actual_content_text or ""
         chunk_size = (
             max(20, math.ceil(len(content_to_chunk) / 10)) if content_to_chunk else 0
         )
 
-        if not content_to_chunk and content_to_chunk != "":
+        if not content_to_chunk and not tool_calls_to_yield:
             empty_delta_data = {
                 "id": response_id,
                 "object": "chat.completion.chunk",
@@ -216,7 +436,7 @@ async def _base_fake_stream_engine(
                 ],
             }
             yield f"data: {json.dumps(empty_delta_data)}\n\n"
-        else:
+        elif content_to_chunk and not tool_calls_to_yield:
             for i in range(0, len(content_to_chunk), chunk_size):
                 chunk_text = content_to_chunk[i : i + chunk_size]
                 content_delta_data = {
@@ -236,7 +456,11 @@ async def _base_fake_stream_engine(
                 if len(content_to_chunk) > chunk_size:
                     await asyncio.sleep(0.05)
 
-        yield create_final_chunk(sse_model_name, response_id)
+        yield create_final_chunk(
+            sse_model_name,
+            response_id,
+            finish_reason="tool_calls" if tool_calls_to_yield else "stop",
+        )
         yield "data: [DONE]\n\n"
 
     except Exception as e:
@@ -306,6 +530,7 @@ async def gemini_fake_stream_generator(
         # 2. Parse the response for reasoning and content using the centralized parser
         separated_reasoning_text = ""
         separated_actual_content_text = ""
+        tool_calls = []
         if hasattr(raw_response, "candidates") and raw_response.candidates:
             # Typically, fake streaming would focus on the first candidate
             separated_reasoning_text, separated_actual_content_text = (
@@ -313,6 +538,7 @@ async def gemini_fake_stream_generator(
                     raw_response.candidates[0]
                 )
             )
+            tool_calls = extract_gemini_tool_calls(raw_response.candidates[0])
         elif (
             hasattr(raw_response, "text") and raw_response.text is not None
         ):  # Fallback for simpler response structures
@@ -361,6 +587,7 @@ async def gemini_fake_stream_generator(
             is_auto_attempt=is_auto_attempt,
             reasoning_text_to_yield=final_reasoning_text,
             actual_content_text_to_yield=final_actual_content_text,
+            tool_calls_to_yield=tool_calls,
         ):
             yield chunk
 
@@ -427,6 +654,7 @@ async def execute_gemini_call(
 
         async def _gemini_real_stream_generator_inner():
             try:
+                saw_tool_call = False
                 async for (
                     chunk_item_call
                 ) in await current_client.aio.models.generate_content_stream(
@@ -434,11 +662,19 @@ async def execute_gemini_call(
                     contents=actual_prompt_for_call,
                     config=gen_config_for_call,
                 ):
+                    if (
+                        getattr(chunk_item_call, "candidates", None)
+                        and extract_gemini_tool_calls(chunk_item_call.candidates[0])
+                    ):
+                        saw_tool_call = True
                     yield convert_chunk_to_openai(
                         chunk_item_call, request_obj.model, response_id_for_stream, 0
                     )
                 yield create_final_chunk(
-                    request_obj.model, response_id_for_stream, cand_count_stream
+                    request_obj.model,
+                    response_id_for_stream,
+                    cand_count_stream,
+                    finish_reason="tool_calls" if saw_tool_call else "stop",
                 )
                 yield "data: [DONE]\n\n"
             except Exception as e_stream_call:

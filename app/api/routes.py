@@ -349,11 +349,7 @@ async def vertex_chat_completions(
     # 转换消息格式
     openai_messages = []
     for message in request.messages:
-        openai_messages.append(
-            OpenAIMessage(
-                role=message.get("role", ""), content=message.get("content", "")
-            )
-        )
+        openai_messages.append(OpenAIMessage.model_validate(message))
 
     # 转换请求格式
     vertex_request = OpenAIRequest(
@@ -371,6 +367,11 @@ async def vertex_chat_completions(
         logprobs=getattr(request, "logprobs", None),
         response_logprobs=getattr(request, "response_logprobs", None),
         n=request.n,
+        tools=request.tools,
+        tool_choice=request.tool_choice,
+        parallel_tool_calls=request.parallel_tool_calls,
+        functions=request.functions,
+        function_call=request.function_call,
     )
 
     # 调用vertex/routes/chat_api的实现

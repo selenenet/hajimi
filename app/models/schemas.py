@@ -23,7 +23,10 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: Optional[str] = None
     # 函数调用
     tools: Optional[List[Dict[str, Any]]] = None
-    tool_choice: Optional[Union[Literal["none", "auto"], Dict[str, Any]]] = "auto"
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = "auto"
+    parallel_tool_calls: Optional[bool] = None
+    functions: Optional[List[Dict[str, Any]]] = None
+    function_call: Optional[Any] = None
 
 
 # gemini 请求

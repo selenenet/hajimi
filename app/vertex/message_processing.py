@@ -3,6 +3,7 @@ import re
 import json
 import time
 import urllib.parse
+from collections import OrderedDict
 from typing import List, Dict, Any, Union, Tuple  # Optional removed
 
 from google.genai import types
@@ -15,6 +16,88 @@ from app.utils.logging import vertex_log
 
 # Define supported roles for Gemini API
 SUPPORTED_ROLES = ["user", "model"]
+_TOOL_SIGNATURE_CACHE = OrderedDict()
+_TOOL_SIGNATURE_CACHE_MAX = 4096
+_TOOL_SIGNATURE_CACHE_TTL_SECONDS = 6 * 60 * 60
+
+
+def _remember_tool_signature(tool_call_id: str, signature: bytes):
+    if not tool_call_id or not signature:
+        return
+    _TOOL_SIGNATURE_CACHE[tool_call_id] = (time.time(), signature)
+    _TOOL_SIGNATURE_CACHE.move_to_end(tool_call_id)
+    while len(_TOOL_SIGNATURE_CACHE) > _TOOL_SIGNATURE_CACHE_MAX:
+        _TOOL_SIGNATURE_CACHE.popitem(last=False)
+
+
+def _cached_tool_signature(tool_call_id: str):
+    cached = _TOOL_SIGNATURE_CACHE.get(tool_call_id)
+    if not cached:
+        return None
+    created_at, signature = cached
+    if time.time() - created_at > _TOOL_SIGNATURE_CACHE_TTL_SECONDS:
+        _TOOL_SIGNATURE_CACHE.pop(tool_call_id, None)
+        return None
+    _TOOL_SIGNATURE_CACHE.move_to_end(tool_call_id)
+    return signature
+
+
+def _tool_call_as_dict(tool_call: Any) -> Dict[str, Any]:
+    if isinstance(tool_call, dict):
+        return tool_call
+    if hasattr(tool_call, "model_dump"):
+        return tool_call.model_dump(exclude_none=True)
+    return {}
+
+
+def _openai_tool_call_name(tool_call: Any) -> str:
+    tool_call_dict = _tool_call_as_dict(tool_call)
+    function = tool_call_dict.get("function") or {}
+    if not isinstance(function, dict):
+        return ""
+    return str(function.get("name") or "")
+
+
+def _openai_tool_call_arguments(tool_call: Any) -> Dict[str, Any]:
+    tool_call_dict = _tool_call_as_dict(tool_call)
+    function = tool_call_dict.get("function") or {}
+    arguments = function.get("arguments", {}) if isinstance(function, dict) else {}
+    if isinstance(arguments, str):
+        try:
+            parsed_arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            parsed_arguments = {"raw_arguments": arguments}
+        return parsed_arguments if isinstance(parsed_arguments, dict) else {"value": parsed_arguments}
+    return arguments if isinstance(arguments, dict) else {"value": arguments}
+
+
+def _openai_tool_call_thought_signature(tool_call: Any):
+    tool_call_dict = _tool_call_as_dict(tool_call)
+    signature_value = tool_call_dict.get("thought_signature")
+    if not signature_value:
+        function = tool_call_dict.get("function") or {}
+        if isinstance(function, dict):
+            signature_value = function.get("thought_signature")
+    if isinstance(signature_value, bytes):
+        return signature_value
+    if isinstance(signature_value, str):
+        try:
+            return base64.b64decode(signature_value, validate=True)
+        except (ValueError, base64.binascii.Error):
+            vertex_log("warning", "Ignoring an invalid tool-call thought signature.")
+    tool_call_id = str(tool_call_dict.get("id") or "")
+    return _cached_tool_signature(tool_call_id)
+
+
+def _function_response_payload(content: Any) -> Dict[str, Any]:
+    if isinstance(content, str):
+        try:
+            parsed_content = json.loads(content)
+        except json.JSONDecodeError:
+            parsed_content = content
+    else:
+        parsed_content = content
+    return parsed_content if isinstance(parsed_content, dict) else {"result": parsed_content}
 
 
 def create_gemini_prompt(
@@ -27,9 +110,18 @@ def create_gemini_prompt(
     vertex_log("debug", "Converting OpenAI messages to Gemini format...")
 
     gemini_messages = []
+    tool_names_by_id = {}
+    for message in messages:
+        for tool_call in message.tool_calls or []:
+            tool_call_dict = _tool_call_as_dict(tool_call)
+            tool_call_id = tool_call_dict.get("id")
+            tool_name = _openai_tool_call_name(tool_call)
+            if tool_call_id and tool_name:
+                tool_names_by_id[str(tool_call_id)] = tool_name
 
     for idx, message in enumerate(messages):
-        if not message.content:
+        has_tool_calls = bool(message.tool_calls)
+        if message.content is None and not has_tool_calls and message.role != "tool":
             vertex_log(
                 "warning",
                 f"Skipping message {idx} due to empty content (Role: {message.role})",
@@ -37,6 +129,26 @@ def create_gemini_prompt(
             continue
 
         role = message.role
+        if role == "tool":
+            tool_name = message.name or tool_names_by_id.get(message.tool_call_id or "")
+            if not tool_name:
+                vertex_log(
+                    "warning",
+                    f"Tool message {idx} has no resolvable function name; using 'tool'.",
+                )
+                tool_name = "tool"
+            response_part = types.Part(
+                function_response=types.FunctionResponse(
+                    id=message.tool_call_id,
+                    name=tool_name,
+                    response=_function_response_payload(message.content),
+                )
+            )
+            # Vertex's generateContent history represents function responses as
+            # user content in the SDK version pinned by this project.
+            gemini_messages.append(types.Content(role="user", parts=[response_part]))
+            continue
+
         if role == "system":
             role = "user"
         elif role == "assistant":
@@ -90,8 +202,33 @@ def create_gemini_prompt(
                                     data=image_bytes, mime_type=mime_type
                                 )
                             )
-        else:
+        elif message.content is not None:
             parts.append(types.Part(text=str(message.content)))
+
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                tool_call_dict = _tool_call_as_dict(tool_call)
+                tool_name = _openai_tool_call_name(tool_call)
+                if not tool_name:
+                    vertex_log("warning", "Skipping a tool call without a function name.")
+                    continue
+                parts.append(
+                    types.Part(
+                        thought_signature=_openai_tool_call_thought_signature(tool_call),
+                        function_call=types.FunctionCall(
+                            id=tool_call_dict.get("id"),
+                            name=tool_name,
+                            args=_openai_tool_call_arguments(tool_call),
+                        )
+                    )
+                )
+
+        if not parts:
+            vertex_log(
+                "warning",
+                f"Skipping message {idx} because it produced no Gemini parts (Role: {message.role})",
+            )
+            continue
 
         content = types.Content(role=role, parts=parts)
         gemini_messages.append(content)
@@ -506,6 +643,56 @@ def parse_gemini_response_for_reasoning_and_content(
     return "".join(reasoning_text_parts), "".join(normal_text_parts)
 
 
+def extract_gemini_tool_calls(candidate: Any) -> List[Dict[str, Any]]:
+    tool_calls = []
+    content = getattr(candidate, "content", None)
+    parts = getattr(content, "parts", None) or []
+    for index, part in enumerate(parts):
+        function_call = getattr(part, "function_call", None)
+        function_name = getattr(function_call, "name", None)
+        if not function_call or not function_name:
+            continue
+        arguments = getattr(function_call, "args", None) or {}
+        if hasattr(arguments, "model_dump"):
+            arguments = arguments.model_dump(exclude_none=True)
+        if not isinstance(arguments, dict):
+            arguments = {"value": arguments}
+        tool_call_id = getattr(function_call, "id", None) or f"call_{index}"
+        thought_signature = getattr(part, "thought_signature", None)
+        tool_call = {
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": function_name,
+                    "arguments": json.dumps(
+                        arguments, ensure_ascii=False, separators=(",", ":")
+                    ),
+                },
+            }
+        if thought_signature:
+            encoded_signature = base64.b64encode(thought_signature).decode("ascii")
+            tool_call["thought_signature"] = encoded_signature
+            _remember_tool_signature(tool_call_id, thought_signature)
+        tool_calls.append(tool_call)
+    return tool_calls
+
+
+def _openai_finish_reason(candidate: Any, has_tool_calls: bool = False):
+    if has_tool_calls:
+        return "tool_calls"
+    finish_reason = getattr(candidate, "finish_reason", None)
+    finish_value = getattr(finish_reason, "value", finish_reason)
+    if finish_value in (None, "FINISH_REASON_UNSPECIFIED"):
+        return None
+    if finish_value == "MAX_TOKENS":
+        return "length"
+    if finish_value in ("SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST"):
+        return "content_filter"
+    if finish_value == "MALFORMED_FUNCTION_CALL":
+        return "tool_calls"
+    return "stop"
+
+
 def convert_to_openai_format(gemini_response, model: str) -> Dict[str, Any]:
     """Converts Gemini response to OpenAI format, applying deobfuscation if needed."""
     is_encrypt_full = model.endswith("-encrypt-full")
@@ -523,14 +710,21 @@ def convert_to_openai_format(gemini_response, model: str) -> Dict[str, Any]:
                 )
                 final_normal_content_str = deobfuscate_text(final_normal_content_str)
 
-            message_payload = {"role": "assistant", "content": final_normal_content_str}
+            tool_calls = extract_gemini_tool_calls(candidate)
+            message_payload = {
+                "role": "assistant",
+                "content": final_normal_content_str or (None if tool_calls else ""),
+            }
             if final_reasoning_content_str:
                 message_payload["reasoning_content"] = final_reasoning_content_str
+            if tool_calls:
+                message_payload["tool_calls"] = tool_calls
 
             choice_item = {
                 "index": i,
                 "message": message_payload,
-                "finish_reason": "stop",
+                "finish_reason": _openai_finish_reason(candidate, bool(tool_calls))
+                or "stop",
             }
             if hasattr(candidate, "logprobs"):
                 choice_item["logprobs"] = getattr(candidate, "logprobs", None)
@@ -594,6 +788,11 @@ def convert_chunk_to_openai(
             not reasoning_text and not delta_payload
         ):  # Ensure content key if nothing else
             delta_payload["content"] = normal_text if normal_text else ""
+        tool_calls = extract_gemini_tool_calls(candidate)
+        if tool_calls:
+            delta_payload.pop("content", None)
+            delta_payload["tool_calls"] = tool_calls
+        finish_reason = _openai_finish_reason(candidate, bool(tool_calls))
 
     chunk_data = {
         "id": response_id,
@@ -619,10 +818,15 @@ def convert_chunk_to_openai(
     return f"data: {json.dumps(chunk_data)}\n\n"
 
 
-def create_final_chunk(model: str, response_id: str, candidate_count: int = 1) -> str:
+def create_final_chunk(
+    model: str,
+    response_id: str,
+    candidate_count: int = 1,
+    finish_reason: str = "stop",
+) -> str:
     choices = []
     for i in range(candidate_count):
-        choices.append({"index": i, "delta": {}, "finish_reason": "stop"})
+        choices.append({"index": i, "delta": {}, "finish_reason": finish_reason})
 
     final_chunk = {
         "id": response_id,
