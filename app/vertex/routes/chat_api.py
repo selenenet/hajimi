@@ -29,6 +29,11 @@ from app.vertex.api_helpers import (
     create_openai_error_response,
     execute_gemini_call,
 )
+from app.vertex.model_variants import (
+    supports_max_thinking_variant,
+    supports_nothinking_variant,
+    thinking_config_for_variant,
+)
 
 router = APIRouter()
 
@@ -117,30 +122,21 @@ async def chat_completions(
         elif is_max_thinking_model:
             base_model_name = base_model_name[: -len("-max")]
 
-        # Define supported models for these specific variants
-        supported_flash_variants = [
-            "gemini-2.5-flash-preview-04-17",
-            "gemini-2.5-flash-preview-05-20",
-            "gemini-2.5-pro-preview-06-05",
-        ]
-        supported_flash_variants_str = "' or '".join(supported_flash_variants)
-
-        # Specific model variant checks (if any remain exclusive and not covered dynamically)
-        if is_nothinking_model and base_model_name not in supported_flash_variants:
+        if is_nothinking_model and not supports_nothinking_variant(base_model_name):
             return JSONResponse(
                 status_code=400,
                 content=create_openai_error_response(
                     400,
-                    f"Model '{request.model}' (-nothinking) is only supported for '{supported_flash_variants_str}'.",
+                    f"Model '{request.model}' (-nothinking) is only supported for Gemini Flash models.",
                     "invalid_request_error",
                 ),
             )
-        if is_max_thinking_model and base_model_name not in supported_flash_variants:
+        if is_max_thinking_model and not supports_max_thinking_variant(base_model_name):
             return JSONResponse(
                 status_code=400,
                 content=create_openai_error_response(
                     400,
-                    f"Model '{request.model}' (-max) is only supported for '{supported_flash_variants_str}'.",
+                    f"Model '{request.model}' (-max) is only supported for Gemini 2.5 Flash models.",
                     "invalid_request_error",
                 ),
             )
@@ -653,17 +649,13 @@ async def chat_completions(
                 )
                 current_prompt_func = create_encrypted_full_gemini_prompt
             elif is_nothinking_model:
-                # 为gemini-2.5-pro-preview-06-05设置特定的thinking_budget
-                if base_model_name == "gemini-2.5-pro-preview-06-05":
-                    generation_config["thinking_config"] = {"thinking_budget": 128}
-                else:
-                    generation_config["thinking_config"] = {"thinking_budget": 0}
+                generation_config["thinking_config"] = thinking_config_for_variant(
+                    base_model_name, "nothinking"
+                )
             elif is_max_thinking_model:
-                # 为gemini-2.5-pro-preview-06-05设置特定的thinking_budget
-                if base_model_name == "gemini-2.5-pro-preview-06-05":
-                    generation_config["thinking_config"] = {"thinking_budget": 32768}
-                else:
-                    generation_config["thinking_config"] = {"thinking_budget": 24576}
+                generation_config["thinking_config"] = thinking_config_for_variant(
+                    base_model_name, "max"
+                )
 
             # For non-auto models, the 'base_model_name' might have suffix stripped.
             # We should use the original 'request.model' for API call if it's a suffixed one,

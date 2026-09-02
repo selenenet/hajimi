@@ -10,6 +10,10 @@ from app.vertex.model_loader import (
 )
 import app.vertex.config as app_config
 from app.vertex.credentials_manager import CredentialManager
+from app.vertex.model_variants import (
+    supports_max_thinking_variant,
+    supports_nothinking_variant,
+)
 from app.utils.logging import vertex_log
 from app.config import settings
 
@@ -292,11 +296,12 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
                         }
                     )
 
-        # Apply special suffixes for models starting with "gemini-2.5-flash"
-        if base_model_without_prefix.startswith(
-            "gemini-2.5-flash"
-        ):  # Suffix rules based on original_model_id
-            special_flash_suffixes = ["-nothinking", "-max"]
+        # Expose a zero-budget alias for all Gemini Flash generations. Keep the
+        # numeric maximum-budget alias limited to Gemini 2.5-era models.
+        if supports_nothinking_variant(base_model_without_prefix):
+            special_flash_suffixes = ["-nothinking"]
+            if supports_max_thinking_variant(base_model_without_prefix):
+                special_flash_suffixes.append("-max")
             for special_suffix in special_flash_suffixes:
                 suffixed_model_part = f"{base_model_without_prefix}{special_suffix}"
                 # Retain EXPRESS prefix if original model had it
@@ -317,42 +322,6 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
                     vertex_log(
                         "info",
                         f"添加特殊后缀模型到列表: {final_special_suffixed_display_id}",
-                    )
-                    dynamic_models_data.append(
-                        {
-                            "id": final_special_suffixed_display_id,
-                            "object": "model",
-                            "created": current_time,
-                            "owned_by": "google",
-                            "permission": [],
-                            "root": base_model_without_prefix,
-                            "parent": None,
-                        }
-                    )
-
-        # Apply special suffixes for gemini-2.5-pro-preview-06-05
-        if base_model_without_prefix == "gemini-2.5-pro-preview-06-05":
-            special_pro_suffixes = ["-nothinking", "-max"]
-            for special_suffix in special_pro_suffixes:
-                suffixed_model_part = f"{base_model_without_prefix}{special_suffix}"
-                # Retain EXPRESS prefix if original model had it
-                if is_express_model:
-                    final_special_suffixed_display_id = (
-                        f"[EXPRESS] {suffixed_model_part}"
-                    )
-                else:
-                    # 非EXPRESS模型的特殊后缀版本也需要正确显示PAY前缀
-                    final_special_suffixed_display_id = (
-                        f"{current_display_prefix}{suffixed_model_part}"
-                    )
-
-                if final_special_suffixed_display_id not in all_model_ids and not any(
-                    m["id"] == final_special_suffixed_display_id
-                    for m in dynamic_models_data
-                ):
-                    vertex_log(
-                        "info",
-                        f"添加gemini-2.5-pro-preview-06-05特殊后缀模型到列表: {final_special_suffixed_display_id}",
                     )
                     dynamic_models_data.append(
                         {
