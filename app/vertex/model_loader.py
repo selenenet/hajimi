@@ -11,6 +11,34 @@ import app.vertex.config as app_config
 _model_cache: Optional[Dict[str, List[str]]] = None
 _cache_lock = asyncio.Lock()
 
+# Google Cloud model lifecycle documentation snapshot (2026-09-02 UTC):
+# https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/model-versions
+#
+# Only text-capable generateContent models are exposed through Hajimi's
+# OpenAI-compatible chat endpoint. Live, image-generation, video, and embedding
+# models use different request/response contracts and are intentionally omitted.
+OFFICIAL_VERTEX_TEXT_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+
+
+def get_builtin_models_config() -> Dict[str, List[str]]:
+    """Return an isolated copy of the Google-official built-in model list."""
+    return {
+        "vertex_models": list(OFFICIAL_VERTEX_TEXT_MODELS),
+        "vertex_express_models": [
+            f"[EXPRESS] {model_name}" for model_name in OFFICIAL_VERTEX_TEXT_MODELS
+        ],
+    }
+
 
 async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
     """
@@ -28,9 +56,12 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
         vertex_log("info", "使用app_config中的MODELS_CONFIG_URL")
 
     if not models_config_url:
-        vertex_log("error", "MODELS_CONFIG_URL is not set in the environment/config.")
-        vertex_log("info", "Using default model configuration with empty lists.")
-        return {"vertex_models": [], "vertex_express_models": []}
+        vertex_log(
+            "info",
+            "Using the built-in Google-official Vertex model list "
+            "(documentation snapshot: 2026-09-02 UTC).",
+        )
+        return get_builtin_models_config()
 
     vertex_log("info", f"Fetching model configuration from: {models_config_url}")
 
@@ -145,9 +176,9 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
                 )
                 return None
 
-    # 如果所有重试都失败，返回默认空配置
-    vertex_log("warning", "获取模型配置失败，使用默认空配置")
-    return {"vertex_models": [], "vertex_express_models": []}
+    # 如果所有重试都失败，返回内置配置
+    vertex_log("warning", "获取模型配置失败，使用内置Google官方模型列表")
+    return get_builtin_models_config()
 
 
 async def get_models_config() -> Dict[str, List[str]]:
@@ -166,9 +197,10 @@ async def get_models_config() -> Dict[str, List[str]]:
             ):  # If fetching failed, use a default empty structure
                 vertex_log(
                     "warning",
-                    "Using default empty model configuration due to fetch/parse failure.",
+                    "Using built-in Google-official model configuration after "
+                    "remote fetch/parse failure.",
                 )
-                _model_cache = {"vertex_models": [], "vertex_express_models": []}
+                _model_cache = get_builtin_models_config()
     return _model_cache
 
 

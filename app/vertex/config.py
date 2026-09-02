@@ -33,12 +33,16 @@ if GOOGLE_CREDENTIALS_JSON:
 PROJECT_ID = os.environ.get("VERTEX_PROJECT_ID", "")
 LOCATION = os.environ.get("VERTEX_LOCATION", "us-central1")
 
-# 模型配置URL
-default_models_config_url = "https://raw.githubusercontent.com/gzzhongqi/vertex2openai/refs/heads/main/vertexModels.json"
+# 模型配置URL。默认留空以使用model_loader.py中的Google官方内置清单；
+# 只有显式设置VERTEX_MODELS_CONFIG_URL时才使用远程覆盖。
+default_models_config_url = ""
 MODELS_CONFIG_URL = os.environ.get(
     "VERTEX_MODELS_CONFIG_URL", default_models_config_url
 )
-vertex_log("info", f"Using models config URL: {MODELS_CONFIG_URL}")
+if MODELS_CONFIG_URL:
+    vertex_log("info", f"Using models config URL override: {MODELS_CONFIG_URL}")
+else:
+    vertex_log("info", "Using built-in Google-official Vertex model list")
 
 # Vertex Express API Key 配置
 VERTEX_EXPRESS_API_KEY_VAL = []
