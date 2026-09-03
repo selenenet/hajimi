@@ -110,6 +110,7 @@ def create_gemini_prompt(
     vertex_log("debug", "Converting OpenAI messages to Gemini format...")
 
     gemini_messages = []
+    pending_tool_response_parts = []
     tool_names_by_id = {}
     for message in messages:
         for tool_call in message.tool_calls or []:
@@ -121,13 +122,6 @@ def create_gemini_prompt(
 
     for idx, message in enumerate(messages):
         has_tool_calls = bool(message.tool_calls)
-        if message.content is None and not has_tool_calls and message.role != "tool":
-            vertex_log(
-                "warning",
-                f"Skipping message {idx} due to empty content (Role: {message.role})",
-            )
-            continue
-
         role = message.role
         if role == "tool":
             tool_name = message.name or tool_names_by_id.get(message.tool_call_id or "")
@@ -137,16 +131,33 @@ def create_gemini_prompt(
                     f"Tool message {idx} has no resolvable function name; using 'tool'.",
                 )
                 tool_name = "tool"
-            response_part = types.Part(
-                function_response=types.FunctionResponse(
-                    id=message.tool_call_id,
-                    name=tool_name,
-                    response=_function_response_payload(message.content),
+            pending_tool_response_parts.append(
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id=message.tool_call_id,
+                        name=tool_name,
+                        response=_function_response_payload(message.content),
+                    )
                 )
             )
-            # Vertex's generateContent history represents function responses as
-            # user content in the SDK version pinned by this project.
-            gemini_messages.append(types.Content(role="user", parts=[response_part]))
+            continue
+
+        if pending_tool_response_parts:
+            # Gemini requires every function response for one function-call turn
+            # to be returned as parts of the same user content. OpenAI represents
+            # those responses as consecutive role="tool" messages, so emitting
+            # one Content per response makes parallel tool calls fail with:
+            # "number of function response parts ... function call parts".
+            gemini_messages.append(
+                types.Content(role="user", parts=pending_tool_response_parts)
+            )
+            pending_tool_response_parts = []
+
+        if message.content is None and not has_tool_calls:
+            vertex_log(
+                "warning",
+                f"Skipping message {idx} due to empty content (Role: {message.role})",
+            )
             continue
 
         if role == "system":
@@ -232,6 +243,11 @@ def create_gemini_prompt(
 
         content = types.Content(role=role, parts=parts)
         gemini_messages.append(content)
+
+    if pending_tool_response_parts:
+        gemini_messages.append(
+            types.Content(role="user", parts=pending_tool_response_parts)
+        )
 
     vertex_log("debug", f"Converted to {len(gemini_messages)} Gemini messages")
     if len(gemini_messages) == 1:
