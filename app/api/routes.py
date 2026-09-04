@@ -165,8 +165,9 @@ async def vertex_list_models(
     request: Request, _=Depends(custom_verify_password), _2=Depends(verify_user_agent)
 ):
     # 使用vertex/routes/models_api的实现
-    assert current_api_key is not None
-    return await models_api.list_models(request, current_api_key)
+    # Listing service-account-backed Vertex models must not require an
+    # unrelated AI Studio key. Authentication was already enforced above.
+    return await models_api.list_models(request, current_api_key or "")
 
 
 # API路由

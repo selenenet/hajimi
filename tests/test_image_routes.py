@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from google.genai import types
 
+from app.api import routes as api_routes
 from app.api.routes import router
 from app.config import settings
 from app.vertex.routes import images_api
@@ -135,6 +136,21 @@ class ImageRouteTests(unittest.TestCase):
             "inlineData"
         ]
         self.assertEqual(base64.b64decode(inline_data["data"]), PNG_BYTES)
+
+    def test_model_listing_does_not_require_ai_studio_key(self):
+        with (
+            patch.object(api_routes, "current_api_key", None),
+            patch.object(
+                api_routes.models_api,
+                "list_models",
+                AsyncMock(return_value={"object": "list", "data": []}),
+            ) as list_models,
+        ):
+            response = self.client.get("/v1/models", headers=self.headers)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        list_models.assert_awaited_once()
+        self.assertEqual(list_models.await_args.args[1], "")
 
 
 if __name__ == "__main__":
