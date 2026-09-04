@@ -1,16 +1,19 @@
 import json
-from typing import Optional, Union
+from typing import List, Optional, Union
 from fastapi import (
     APIRouter,
     Body,
+    File,
+    Form,
     HTTPException,
     Path,
     Query,
     Request,
     Depends,
+    UploadFile,
     status,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from app.services import GeminiClient
 from app.utils import protect_from_abuse, generate_cache_key, log
 from app.utils.response import openAI_from_Gemini
@@ -26,12 +29,18 @@ from app.models.schemas import (
     ChatRequestGemini,
     EmbeddingRequest,
     EmbeddingResponse,
+    ImageGenerationRequest,
 )
 from app.services.embedding import EmbeddingClient
 import app.config.settings as settings
 import asyncio
-from app.vertex.routes import chat_api, models_api
+from app.vertex.routes import chat_api, images_api, models_api
 from app.vertex.models import OpenAIRequest, OpenAIMessage
+from app.vertex.image_processing import (
+    DEFAULT_IMAGE_MODEL,
+    ImageProxyError,
+    is_image_model,
+)
 
 # 创建路由器
 router = APIRouter()
@@ -415,6 +424,7 @@ async def gemini_list_models(
 @router.post("/gemini/{api_version:str}/models/{model_and_responseType:path}")
 async def gemini_chat_completions(
     request: Request,
+    api_version: str = Path(...),
     model_and_responseType: str = Path(...),
     key: Optional[str] = Query(None),
     alt: Optional[str] = Query(None, description=" sse 或 None"),
@@ -433,10 +443,118 @@ async def gemini_chat_completions(
     except ValueError:
         raise HTTPException(status_code=400, detail="无效的请求路径")
 
+    if settings.ENABLE_VERTEX and is_image_model(model_name):
+        if api_version not in {"v1", "v1beta"}:
+            return images_api.native_error_response(
+                ImageProxyError(400, "Image models support Gemini API v1 and v1beta only.")
+            )
+        if action_type not in {"generateContent", "streamGenerateContent"}:
+            return images_api.native_error_response(
+                ImageProxyError(
+                    400,
+                    "Image models support generateContent and streamGenerateContent only.",
+                )
+            )
+        await protect_from_abuse(
+            request,
+            settings.MAX_REQUESTS_PER_MINUTE,
+            settings.MAX_REQUESTS_PER_DAY_PER_IP,
+        )
+        try:
+            return await images_api.generate_native_image(
+                request,
+                model_name=model_name,
+                payload=payload.model_dump(exclude_none=True),
+                stream=is_stream,
+            )
+        except ImageProxyError as error:
+            return images_api.native_error_response(error)
+
     geminiRequest = AIRequest(
         payload=payload, model=model_name, stream=is_stream, format_type="gemini"
     )
     return await aistudio_chat_completions(geminiRequest, request, _dp, _du)
+
+
+def _validate_openai_image_options(n: int, response_format: str) -> None:
+    if n != 1:
+        raise ImageProxyError(
+            400,
+            "Only n=1 is supported. Gemini image models use one candidate per request.",
+        )
+    if response_format != "b64_json":
+        raise ImageProxyError(
+            400,
+            "Only response_format='b64_json' is supported; generated images are not stored on the server.",
+        )
+
+
+@router.post("/v1/images/generations")
+@router.post("/images/generations")
+async def create_image_generation(
+    image_request: ImageGenerationRequest,
+    http_request: Request,
+    _dp=Depends(custom_verify_password),
+    _du=Depends(verify_user_agent),
+):
+    await protect_from_abuse(
+        http_request,
+        settings.MAX_REQUESTS_PER_MINUTE,
+        settings.MAX_REQUESTS_PER_DAY_PER_IP,
+    )
+    try:
+        _validate_openai_image_options(
+            image_request.n,
+            image_request.response_format,
+        )
+        result = await images_api.generate_openai_image(
+            http_request,
+            model_name=image_request.model,
+            prompt=image_request.prompt,
+            size=image_request.size,
+            aspect_ratio=image_request.aspect_ratio,
+            image_size=image_request.image_size,
+        )
+        return JSONResponse(content=result)
+    except ImageProxyError as error:
+        return images_api.openai_error_response(error)
+
+
+@router.post("/v1/images/edits")
+@router.post("/images/edits")
+async def create_image_edit(
+    http_request: Request,
+    image: List[UploadFile] = File(...),
+    prompt: str = Form(...),
+    model: str = Form(DEFAULT_IMAGE_MODEL),
+    n: int = Form(1),
+    size: str = Form("1024x1024"),
+    response_format: str = Form("b64_json"),
+    aspect_ratio: Optional[str] = Form(None),
+    image_size: Optional[str] = Form(None),
+    _dp=Depends(custom_verify_password),
+    _du=Depends(verify_user_agent),
+):
+    await protect_from_abuse(
+        http_request,
+        settings.MAX_REQUESTS_PER_MINUTE,
+        settings.MAX_REQUESTS_PER_DAY_PER_IP,
+    )
+    try:
+        _validate_openai_image_options(n, response_format)
+        input_images = await images_api.read_uploaded_images(image)
+        result = await images_api.generate_openai_image(
+            http_request,
+            model_name=model,
+            prompt=prompt,
+            size=size,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+            input_images=input_images,
+        )
+        return JSONResponse(content=result)
+    except ImageProxyError as error:
+        return images_api.openai_error_response(error)
 
 
 @router.post("/v1/embeddings", response_model=EmbeddingResponse)

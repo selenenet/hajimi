@@ -14,6 +14,7 @@ from app.vertex.model_variants import (
     supports_max_thinking_variant,
     supports_nothinking_variant,
 )
+from app.vertex.image_processing import is_image_model
 from app.utils.logging import vertex_log
 from app.config import settings
 
@@ -259,6 +260,11 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
             }
         )
 
+        # Image models have dedicated request/response contracts. Expose only
+        # their base [PAY] IDs, without chat, thinking, encryption, or auto aliases.
+        if is_image_model(base_model_without_prefix):
+            continue
+
         # Conditionally add common variations (standard suffixes)
         if not base_model_without_prefix.startswith(
             "gemini-2.0"
@@ -347,6 +353,8 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
             for base_model_id_for_openai in (
                 raw_vertex_models
             ):  # Iterate through original list of GAIA/Vertex base models
+                if is_image_model(base_model_id_for_openai):
+                    continue
                 display_model_id = ""
                 if EXPERIMENTAL_MARKER in base_model_id_for_openai:
                     display_model_id = (

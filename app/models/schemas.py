@@ -1,5 +1,5 @@
 from typing import List, Dict, Optional, Union, Literal, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # openAI 请求
@@ -29,6 +29,23 @@ class ChatCompletionRequest(BaseModel):
     function_call: Optional[Any] = None
 
 
+class ImageGenerationRequest(BaseModel):
+    model: str = "[PAY]gemini-3.1-flash-image"
+    prompt: str
+    n: int = 1
+    size: str = "1024x1024"
+    response_format: str = "b64_json"
+    aspect_ratio: Optional[str] = None
+    image_size: Optional[str] = None
+    # Common OpenAI fields are accepted for client compatibility. Gemini does
+    # not provide equivalent controls for these fields, so they are not forwarded.
+    quality: Optional[str] = None
+    style: Optional[str] = None
+    user: Optional[str] = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
 # gemini 请求
 class ChatRequestGemini(BaseModel):
     contents: List[Dict[str, Any]]
@@ -37,6 +54,8 @@ class ChatRequestGemini(BaseModel):
     safetySettings: Optional[List[Dict[str, Any]]] = None
     generationConfig: Optional[Dict[str, Any]] = None
     tools: Optional[List[Dict[str, Any]]] = None
+
+    model_config = ConfigDict(extra="allow")
 
 
 # AI模型请求包装

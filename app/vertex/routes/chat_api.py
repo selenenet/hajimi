@@ -34,6 +34,7 @@ from app.vertex.model_variants import (
     supports_nothinking_variant,
     thinking_config_for_variant,
 )
+from app.vertex.image_processing import is_image_model
 
 router = APIRouter()
 
@@ -121,6 +122,17 @@ async def chat_completions(
             base_model_name = base_model_name[: -len("-nothinking")]
         elif is_max_thinking_model:
             base_model_name = base_model_name[: -len("-max")]
+
+        if is_image_model(base_model_name):
+            return JSONResponse(
+                status_code=400,
+                content=create_openai_error_response(
+                    400,
+                    "Image models are not supported by /v1/chat/completions. "
+                    "Use /v1/images/generations, /v1/images/edits, or the Gemini-native endpoint.",
+                    "invalid_request_error",
+                ),
+            )
 
         if is_nothinking_model and not supports_nothinking_variant(base_model_name):
             return JSONResponse(

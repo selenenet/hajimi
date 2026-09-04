@@ -125,6 +125,46 @@
 - **POST** `/v1/chat/completions` - 聊天补全接口，支持流式和非流式响应
 - **POST** `/chat/completions` - 聊天补全接口（兼容旧版本）
 
+### Nano Banana 图片接口（Vertex 模式）
+
+- **POST** `/v1/images/generations` - OpenAI 格式文生图接口
+- **POST** `/v1/images/edits` - OpenAI multipart 格式多图编辑接口
+- **POST** `/gemini/v1/models/{image-model}:generateContent` - Gemini 原生图片接口
+- **POST** `/gemini/v1/models/{image-model}:streamGenerateContent` - Gemini 原生 SSE 图片接口
+
+当前图片模型：`gemini-3.1-flash-image`、`gemini-3.1-flash-lite-image`、
+`gemini-3-pro-image` 和兼容旧版 `gemini-2.5-flash-image`。OpenAI 接口的模型
+ID 带 `[PAY]` 前缀，默认使用 `[PAY]gemini-3.1-flash-image`。
+
+文生图示例：
+
+```bash
+curl https://example.com/v1/images/generations \
+  -H "Authorization: Bearer $HAJIMI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "[PAY]gemini-3.1-flash-image",
+    "prompt": "A blue paper crane on a clean white desk",
+    "size": "1024x1024",
+    "response_format": "b64_json"
+  }'
+```
+
+图片编辑示例：
+
+```bash
+curl https://example.com/v1/images/edits \
+  -H "Authorization: Bearer $HAJIMI_API_KEY" \
+  -F "model=[PAY]gemini-3.1-flash-image" \
+  -F "prompt=Add a small knitted wizard hat" \
+  -F "image=@cat.png;type=image/png" \
+  -F "response_format=b64_json"
+```
+
+OpenAI 图片接口只返回 `b64_json`，不会为图片创建公开 URL 或持久化文件。
+`n` 当前必须为 `1`。可使用扩展字段 `aspect_ratio` 和 `image_size` 覆盖标准
+`size` 映射；Gemini 原生接口则可直接传递 `generationConfig.imageConfig`。
+
 ### Vertex 模式接口
 
 - **GET** `/vertex/models` - 获取 Vertex 模型列表

@@ -14,9 +14,9 @@ _cache_lock = asyncio.Lock()
 # Google Cloud model lifecycle documentation snapshot (2026-09-02 UTC):
 # https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/model-versions
 #
-# Only text-capable generateContent models are exposed through Hajimi's
-# OpenAI-compatible chat endpoint. Live, image-generation, video, and embedding
-# models use different request/response contracts and are intentionally omitted.
+# Image models are listed alongside text models, but are handled only by the
+# dedicated image and Gemini-native endpoints. Live, video, and embedding models
+# use different contracts and remain intentionally omitted.
 OFFICIAL_VERTEX_TEXT_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -29,11 +29,20 @@ OFFICIAL_VERTEX_TEXT_MODELS = [
     "gemini-2.5-flash-lite",
 ]
 
+OFFICIAL_VERTEX_IMAGE_MODELS = [
+    "gemini-3.1-flash-image",
+    "gemini-3.1-flash-lite-image",
+    "gemini-3-pro-image",
+    "gemini-2.5-flash-image",
+]
+
 
 def get_builtin_models_config() -> Dict[str, List[str]]:
     """Return an isolated copy of the Google-official built-in model list."""
     return {
-        "vertex_models": list(OFFICIAL_VERTEX_TEXT_MODELS),
+        "vertex_models": list(
+            dict.fromkeys(OFFICIAL_VERTEX_TEXT_MODELS + OFFICIAL_VERTEX_IMAGE_MODELS)
+        ),
         "vertex_express_models": [
             f"[EXPRESS] {model_name}" for model_name in OFFICIAL_VERTEX_TEXT_MODELS
         ],
@@ -206,7 +215,10 @@ async def get_models_config() -> Dict[str, List[str]]:
 
 async def get_vertex_models() -> List[str]:
     config = await get_models_config()
-    return config.get("vertex_models", [])
+    configured_models = config.get("vertex_models", [])
+    # Image models require SA-backed Vertex access. Keep them present even when a
+    # remote text-model configuration is in use, but never add Express aliases.
+    return list(dict.fromkeys(configured_models + OFFICIAL_VERTEX_IMAGE_MODELS))
 
 
 async def get_vertex_express_models() -> List[str]:
