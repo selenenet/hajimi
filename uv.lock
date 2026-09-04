@@ -562,7 +562,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "apscheduler", specifier = ">=3.11.0" },
-    { name = "fastapi", specifier = ">=0.115.12" },
+    { name = "fastapi", specifier = "==0.115.12" },
     { name = "google-auth", specifier = "==2.57.0" },
     { name = "google-cloud-aiplatform", specifier = "==1.86.0" },
     { name = "google-genai", specifier = "==2.6.0" },
@@ -575,7 +575,7 @@ requires-dist = [
     { name = "python-multipart", specifier = "==0.0.20" },
     { name = "requests", specifier = ">=2.32.3" },
     { name = "tzdata", specifier = ">=2025.2" },
-    { name = "uvicorn", specifier = ">=0.34.2" },
+    { name = "uvicorn", specifier = "==0.34.2" },
     { name = "xxhash", specifier = ">=0.8.2" },
 ]
 

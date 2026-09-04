@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "apscheduler>=3.11.0",
-    "fastapi>=0.115.12",
+    "fastapi==0.115.12",
     "google-auth==2.57.0",
     "google-cloud-aiplatform==1.86.0",
     "google-genai==2.6.0",
@@ -19,6 +19,6 @@ dependencies = [
     "python-dotenv>=1.1.0",
     "requests>=2.32.3",
     "tzdata>=2025.2",
-    "uvicorn>=0.34.2",
+    "uvicorn==0.34.2",
     "xxhash>=0.8.2",
 ]
