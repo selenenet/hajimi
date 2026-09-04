@@ -17,6 +17,7 @@ from app.vertex.image_processing import (
     MAX_INPUT_IMAGES,
     MAX_TOTAL_INPUT_BYTES,
     build_image_generation_config,
+    augment_openai_image_prompt,
     create_image_contents,
     map_upstream_exception,
     native_error_payload,
@@ -86,42 +87,75 @@ async def generate_openai_image(
     size: str,
     aspect_ratio: str | None,
     image_size: str | None,
+    quality: str | None = "auto",
+    output_format: str | None = "png",
+    output_compression: int | None = None,
+    background: str | None = "auto",
+    moderation: str | None = "auto",
+    style: str | None = None,
+    input_fidelity: str | None = None,
+    n: int = 1,
+    response_format: str = "b64_json",
+    stream: bool | None = False,
+    partial_images: int | None = 0,
+    mask_provided: bool = False,
     input_images: Sequence[InputImage] = (),
 ) -> Dict[str, Any]:
-    model, config = build_image_generation_config(
+    options, config = build_image_generation_config(
         model_name,
         size=size,
         aspect_ratio=aspect_ratio,
         image_size=image_size,
+        quality=quality,
+        output_format=output_format,
+        output_compression=output_compression,
+        background=background,
+        moderation=moderation,
+        style=style,
+        input_fidelity=input_fidelity,
+        n=n,
+        response_format=response_format,
+        stream=stream,
+        partial_images=partial_images,
+        mask_provided=mask_provided,
     )
-    contents = create_image_contents(prompt, input_images)
+    augmented_prompt = augment_openai_image_prompt(
+        prompt,
+        options,
+        is_edit=bool(input_images),
+    )
+    contents = create_image_contents(augmented_prompt, input_images)
     client = await _get_client(request)
     input_bytes = sum(len(image.data) for image in input_images)
     started = time.monotonic()
     vertex_log(
         "info",
-        f"Vertex image request started: model={model}, "
+        f"Vertex image request started: model={options.model}, "
         f"input_images={len(input_images)}, input_bytes={input_bytes}",
     )
     try:
         response = await client.aio.models.generate_content(
-            model=model,
+            model=options.model,
             contents=contents,
             config=config,
         )
-        result = openai_image_response(response, int(time.time()))
+        result = openai_image_response(
+            response,
+            int(time.time()),
+            expected_mime_type=options.output_mime_type,
+        )
     except Exception as exc:
         error = map_upstream_exception(exc)
         vertex_log(
             "error",
-            f"Vertex image request failed: model={model}, "
+            f"Vertex image request failed: model={options.model}, "
             f"status={error.status_code}, error_type={error.error_type}",
         )
         raise error from exc
 
     vertex_log(
         "info",
-        f"Vertex image request completed: model={model}, "
+        f"Vertex image request completed: model={options.model}, "
         f"output_images={len(result['data'])}, "
         f"latency_ms={int((time.monotonic() - started) * 1000)}",
     )

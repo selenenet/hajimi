@@ -146,6 +146,9 @@ curl https://example.com/v1/images/generations \
     "model": "[PAY]gemini-3.1-flash-image",
     "prompt": "A blue paper crane on a clean white desk",
     "size": "1024x1024",
+    "quality": "low",
+    "output_format": "webp",
+    "output_compression": 80,
     "response_format": "b64_json"
   }'
 ```
@@ -158,12 +161,27 @@ curl https://example.com/v1/images/edits \
   -F "model=[PAY]gemini-3.1-flash-image" \
   -F "prompt=Add a small knitted wizard hat" \
   -F "image=@cat.png;type=image/png" \
+  -F "quality=medium" \
+  -F "output_format=png" \
   -F "response_format=b64_json"
 ```
 
 OpenAI 图片接口只返回 `b64_json`，不会为图片创建公开 URL 或持久化文件。
-`n` 当前必须为 `1`。可使用扩展字段 `aspect_ratio` 和 `image_size` 覆盖标准
-`size` 映射；Gemini 原生接口则可直接传递 `generationConfig.imageConfig`。
+`n` 当前必须为 `1`，不支持 `stream`、`partial_images` 或 `mask`。编辑接口同时
+接受重复的 `image` 和 `image[]` 字段。
+
+- `size` 支持 `auto`、`1024x1024`、`1536x1024` 和 `1024x1536`。
+- `quality` 映射为输出分辨率：`low=512`、`medium/standard=1K`、
+  `high/hd=2K`。目标模型不支持该分辨率时返回 400，不自动降级。
+- `output_format` 支持 `png`、`jpeg`、`webp`；`output_compression` 为
+  `0-100`，仅适用于 JPEG/WebP。
+- `background` 支持 `auto`、`transparent`、`opaque`，`style` 支持
+  `vivid`、`natural`；这些值通过提示词近似实现，不是 Gemini 原生保证。
+- `moderation=auto/low` 均保留 Google 自身安全策略，不会降低上游过滤级别。
+- 扩展字段 `aspect_ratio` 优先于 `size`；`image_size` 优先于 `quality`。
+
+Gemini 原生接口可直接传递 `generationConfig.imageConfig`，适合使用 OpenAI
+字段未覆盖的 Gemini 高级选项。
 
 ### Vertex 模式接口
 

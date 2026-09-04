@@ -37,9 +37,13 @@ class ImageGenerationRequest(BaseModel):
     response_format: str = "b64_json"
     aspect_ratio: Optional[str] = None
     image_size: Optional[str] = None
-    # Common OpenAI fields are accepted for client compatibility. Gemini does
-    # not provide equivalent controls for these fields, so they are not forwarded.
-    quality: Optional[str] = None
+    quality: Optional[str] = "auto"
+    output_format: Optional[str] = "png"
+    output_compression: Optional[int] = None
+    background: Optional[str] = "auto"
+    moderation: Optional[str] = "auto"
+    stream: Optional[bool] = False
+    partial_images: Optional[int] = 0
     style: Optional[str] = None
     user: Optional[str] = None
 

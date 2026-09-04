@@ -477,19 +477,6 @@ async def gemini_chat_completions(
     return await aistudio_chat_completions(geminiRequest, request, _dp, _du)
 
 
-def _validate_openai_image_options(n: int, response_format: str) -> None:
-    if n != 1:
-        raise ImageProxyError(
-            400,
-            "Only n=1 is supported. Gemini image models use one candidate per request.",
-        )
-    if response_format != "b64_json":
-        raise ImageProxyError(
-            400,
-            "Only response_format='b64_json' is supported; generated images are not stored on the server.",
-        )
-
-
 @router.post("/v1/images/generations")
 @router.post("/images/generations")
 async def create_image_generation(
@@ -504,10 +491,6 @@ async def create_image_generation(
         settings.MAX_REQUESTS_PER_DAY_PER_IP,
     )
     try:
-        _validate_openai_image_options(
-            image_request.n,
-            image_request.response_format,
-        )
         result = await images_api.generate_openai_image(
             http_request,
             model_name=image_request.model,
@@ -515,6 +498,16 @@ async def create_image_generation(
             size=image_request.size,
             aspect_ratio=image_request.aspect_ratio,
             image_size=image_request.image_size,
+            quality=image_request.quality,
+            output_format=image_request.output_format,
+            output_compression=image_request.output_compression,
+            background=image_request.background,
+            moderation=image_request.moderation,
+            style=image_request.style,
+            n=image_request.n,
+            response_format=image_request.response_format,
+            stream=image_request.stream,
+            partial_images=image_request.partial_images,
         )
         return JSONResponse(content=result)
     except ImageProxyError as error:
@@ -525,7 +518,9 @@ async def create_image_generation(
 @router.post("/images/edits")
 async def create_image_edit(
     http_request: Request,
-    image: List[UploadFile] = File(...),
+    image: Optional[List[UploadFile]] = File(None),
+    image_brackets: Optional[List[UploadFile]] = File(None, alias="image[]"),
+    mask: Optional[UploadFile] = File(None),
     prompt: str = Form(...),
     model: str = Form(DEFAULT_IMAGE_MODEL),
     n: int = Form(1),
@@ -533,6 +528,16 @@ async def create_image_edit(
     response_format: str = Form("b64_json"),
     aspect_ratio: Optional[str] = Form(None),
     image_size: Optional[str] = Form(None),
+    quality: Optional[str] = Form("auto"),
+    output_format: Optional[str] = Form("png"),
+    output_compression: Optional[int] = Form(None),
+    background: Optional[str] = Form("auto"),
+    moderation: Optional[str] = Form("auto"),
+    style: Optional[str] = Form(None),
+    input_fidelity: Optional[str] = Form(None),
+    stream: Optional[bool] = Form(False),
+    partial_images: Optional[int] = Form(0),
+    user: Optional[str] = Form(None),
     _dp=Depends(custom_verify_password),
     _du=Depends(verify_user_agent),
 ):
@@ -542,8 +547,11 @@ async def create_image_edit(
         settings.MAX_REQUESTS_PER_DAY_PER_IP,
     )
     try:
-        _validate_openai_image_options(n, response_format)
-        input_images = await images_api.read_uploaded_images(image)
+        uploads = [*(image or []), *(image_brackets or [])]
+        mask_provided = mask is not None
+        if mask is not None:
+            await mask.close()
+        input_images = await images_api.read_uploaded_images(uploads)
         result = await images_api.generate_openai_image(
             http_request,
             model_name=model,
@@ -551,6 +559,18 @@ async def create_image_edit(
             size=size,
             aspect_ratio=aspect_ratio,
             image_size=image_size,
+            quality=quality,
+            output_format=output_format,
+            output_compression=output_compression,
+            background=background,
+            moderation=moderation,
+            style=style,
+            input_fidelity=input_fidelity,
+            n=n,
+            response_format=response_format,
+            stream=stream,
+            partial_images=partial_images,
+            mask_provided=mask_provided,
             input_images=input_images,
         )
         return JSONResponse(content=result)

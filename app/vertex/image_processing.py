@@ -47,6 +47,25 @@ SUPPORTED_ASPECT_RATIOS = {
     "9:21",
 }
 
+OUTPUT_FORMAT_MIME_TYPES = {
+    "png": "image/png",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+}
+
+QUALITY_IMAGE_SIZES = {
+    "low": "512",
+    "medium": "1K",
+    "standard": "1K",
+    "high": "2K",
+    "hd": "2K",
+}
+
+SUPPORTED_BACKGROUNDS = {"auto", "transparent", "opaque"}
+SUPPORTED_MODERATION_LEVELS = {"auto", "low"}
+SUPPORTED_STYLES = {"vivid", "natural"}
+SUPPORTED_INPUT_FIDELITY = {"high", "low"}
+
 OPENAI_SIZE_MAP: Dict[str, Tuple[Optional[str], Optional[str]]] = {
     "auto": (None, None),
     "1024x1024": ("1:1", "1K"),
@@ -70,11 +89,13 @@ class ImageProxyError(Exception):
         status_code: int,
         message: str,
         error_type: str = "invalid_request_error",
+        param: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.error_type = error_type
+        self.param = param
 
 
 @dataclass(frozen=True)
@@ -87,6 +108,22 @@ class InputImage:
 class GeneratedImage:
     b64_json: str
     mime_type: str
+
+
+@dataclass(frozen=True)
+class ResolvedImageOptions:
+    model: str
+    size: str
+    aspect_ratio: Optional[str]
+    image_size: Optional[str]
+    quality: str
+    output_format: str
+    output_mime_type: str
+    output_compression: Optional[int]
+    background: str
+    moderation: str
+    style: Optional[str]
+    input_fidelity: Optional[str]
 
 
 def normalize_image_model(model_name: str) -> str:
@@ -121,19 +158,73 @@ def resolve_image_options(
     size: str = "1024x1024",
     aspect_ratio: Optional[str] = None,
     image_size: Optional[str] = None,
-) -> Tuple[str, str, Optional[str], Optional[str]]:
+    quality: Optional[str] = "auto",
+    output_format: Optional[str] = "png",
+    output_compression: Optional[int] = None,
+    background: Optional[str] = "auto",
+    moderation: Optional[str] = "auto",
+    style: Optional[str] = None,
+    input_fidelity: Optional[str] = None,
+    n: int = 1,
+    response_format: str = "b64_json",
+    stream: Optional[bool] = False,
+    partial_images: Optional[int] = 0,
+    mask_provided: bool = False,
+) -> ResolvedImageOptions:
     """Validate model/options and resolve OpenAI sizes to Gemini options."""
     model = normalize_image_model(model_name)
+    if n != 1:
+        raise ImageProxyError(
+            400,
+            "Only n=1 is supported. Gemini image models use one candidate per request.",
+            param="n",
+        )
+    if response_format != "b64_json":
+        raise ImageProxyError(
+            400,
+            "Only response_format='b64_json' is supported; generated images are not stored on the server.",
+            param="response_format",
+        )
+    if stream:
+        raise ImageProxyError(
+            400,
+            "OpenAI image streaming is not supported.",
+            param="stream",
+        )
+    if partial_images not in {None, 0}:
+        raise ImageProxyError(
+            400,
+            "partial_images is not supported; omit it or set it to 0.",
+            param="partial_images",
+        )
+    if mask_provided:
+        raise ImageProxyError(
+            400,
+            "mask is not supported by Gemini semantic image editing.",
+            param="mask",
+        )
+
     if size not in OPENAI_SIZE_MAP:
         allowed_sizes = ", ".join(OPENAI_SIZE_MAP)
         raise ImageProxyError(
             400,
             f"Unsupported size '{size}'. Supported values: {allowed_sizes}.",
+            param="size",
         )
 
     mapped_aspect_ratio, mapped_image_size = OPENAI_SIZE_MAP[size]
     resolved_aspect_ratio = aspect_ratio or mapped_aspect_ratio
-    resolved_image_size = image_size or mapped_image_size
+
+    normalized_quality = (quality or "auto").lower()
+    if normalized_quality not in {*QUALITY_IMAGE_SIZES, "auto"}:
+        allowed_quality = ", ".join(["auto", *QUALITY_IMAGE_SIZES])
+        raise ImageProxyError(
+            400,
+            f"Unsupported quality '{quality}'. Supported values: {allowed_quality}.",
+            param="quality",
+        )
+    quality_image_size = QUALITY_IMAGE_SIZES.get(normalized_quality)
+    resolved_image_size = image_size or quality_image_size or mapped_image_size
 
     if (
         resolved_aspect_ratio is not None
@@ -142,6 +233,7 @@ def resolve_image_options(
         raise ImageProxyError(
             400,
             f"Unsupported aspect_ratio '{resolved_aspect_ratio}'.",
+            param="aspect_ratio",
         )
 
     if resolved_image_size is not None:
@@ -155,9 +247,86 @@ def resolve_image_options(
                 400,
                 f"Model '{model}' does not support image_size "
                 f"'{resolved_image_size}'. Supported values: {allowed}.",
+                param="image_size" if image_size else "quality",
             )
 
-    return model, size, resolved_aspect_ratio, resolved_image_size
+    normalized_output_format = (output_format or "png").lower()
+    if normalized_output_format not in OUTPUT_FORMAT_MIME_TYPES:
+        allowed_formats = ", ".join(OUTPUT_FORMAT_MIME_TYPES)
+        raise ImageProxyError(
+            400,
+            f"Unsupported output_format '{output_format}'. Supported values: {allowed_formats}.",
+            param="output_format",
+        )
+    if output_compression is not None:
+        if not 0 <= output_compression <= 100:
+            raise ImageProxyError(
+                400,
+                "output_compression must be between 0 and 100.",
+                param="output_compression",
+            )
+        if normalized_output_format == "png":
+            raise ImageProxyError(
+                400,
+                "output_compression is only supported with jpeg or webp output.",
+                param="output_compression",
+            )
+
+    normalized_background = (background or "auto").lower()
+    if normalized_background not in SUPPORTED_BACKGROUNDS:
+        raise ImageProxyError(
+            400,
+            f"Unsupported background '{background}'. Supported values: auto, transparent, opaque.",
+            param="background",
+        )
+    if normalized_background == "transparent" and normalized_output_format not in {
+        "png",
+        "webp",
+    }:
+        raise ImageProxyError(
+            400,
+            "background='transparent' requires output_format='png' or 'webp'.",
+            param="background",
+        )
+
+    normalized_moderation = (moderation or "auto").lower()
+    if normalized_moderation not in SUPPORTED_MODERATION_LEVELS:
+        raise ImageProxyError(
+            400,
+            f"Unsupported moderation '{moderation}'. Supported values: auto, low.",
+            param="moderation",
+        )
+
+    normalized_style = style.lower() if style else None
+    if normalized_style not in {None, *SUPPORTED_STYLES}:
+        raise ImageProxyError(
+            400,
+            f"Unsupported style '{style}'. Supported values: vivid, natural.",
+            param="style",
+        )
+
+    normalized_input_fidelity = input_fidelity.lower() if input_fidelity else None
+    if normalized_input_fidelity not in {None, *SUPPORTED_INPUT_FIDELITY}:
+        raise ImageProxyError(
+            400,
+            f"Unsupported input_fidelity '{input_fidelity}'. Supported values: high, low.",
+            param="input_fidelity",
+        )
+
+    return ResolvedImageOptions(
+        model=model,
+        size=size,
+        aspect_ratio=resolved_aspect_ratio,
+        image_size=resolved_image_size,
+        quality=normalized_quality,
+        output_format=normalized_output_format,
+        output_mime_type=OUTPUT_FORMAT_MIME_TYPES[normalized_output_format],
+        output_compression=output_compression,
+        background=normalized_background,
+        moderation=normalized_moderation,
+        style=normalized_style,
+        input_fidelity=normalized_input_fidelity,
+    )
 
 
 def build_image_generation_config(
@@ -165,23 +334,85 @@ def build_image_generation_config(
     size: str = "1024x1024",
     aspect_ratio: Optional[str] = None,
     image_size: Optional[str] = None,
-) -> Tuple[str, types.GenerateContentConfig]:
-    model, _, resolved_aspect_ratio, resolved_image_size = resolve_image_options(
+    quality: Optional[str] = "auto",
+    output_format: Optional[str] = "png",
+    output_compression: Optional[int] = None,
+    background: Optional[str] = "auto",
+    moderation: Optional[str] = "auto",
+    style: Optional[str] = None,
+    input_fidelity: Optional[str] = None,
+    n: int = 1,
+    response_format: str = "b64_json",
+    stream: Optional[bool] = False,
+    partial_images: Optional[int] = 0,
+    mask_provided: bool = False,
+) -> Tuple[ResolvedImageOptions, types.GenerateContentConfig]:
+    options = resolve_image_options(
         model_name,
         size=size,
         aspect_ratio=aspect_ratio,
         image_size=image_size,
+        quality=quality,
+        output_format=output_format,
+        output_compression=output_compression,
+        background=background,
+        moderation=moderation,
+        style=style,
+        input_fidelity=input_fidelity,
+        n=n,
+        response_format=response_format,
+        stream=stream,
+        partial_images=partial_images,
+        mask_provided=mask_provided,
     )
-    image_config: Dict[str, Any] = {"image_output_options": {"mime_type": "image/png"}}
-    if resolved_aspect_ratio is not None:
-        image_config["aspect_ratio"] = resolved_aspect_ratio
-    if resolved_image_size is not None:
-        image_config["image_size"] = resolved_image_size
+    output_options: Dict[str, Any] = {"mime_type": options.output_mime_type}
+    if options.output_compression is not None:
+        output_options["compression_quality"] = options.output_compression
+    image_config: Dict[str, Any] = {"image_output_options": output_options}
+    if options.aspect_ratio is not None:
+        image_config["aspect_ratio"] = options.aspect_ratio
+    if options.image_size is not None:
+        image_config["image_size"] = options.image_size
 
-    return model, types.GenerateContentConfig(
+    return options, types.GenerateContentConfig(
         candidate_count=1,
         response_modalities=["TEXT", "IMAGE"],
         image_config=types.ImageConfig.model_validate(image_config),
+    )
+
+
+def augment_openai_image_prompt(
+    prompt: str,
+    options: ResolvedImageOptions,
+    *,
+    is_edit: bool,
+) -> str:
+    """Apply best-effort OpenAI-only controls as explicit prompt constraints."""
+    requirements: List[str] = []
+    if options.background == "transparent":
+        requirements.append(
+            "Return the final image with a genuinely transparent background and alpha channel; do not draw a checkerboard pattern."
+        )
+    elif options.background == "opaque":
+        requirements.append(
+            "Return the final image with a fully opaque background and no transparency."
+        )
+    if options.style == "vivid":
+        requirements.append("Use a vivid, highly saturated, dramatic visual treatment.")
+    elif options.style == "natural":
+        requirements.append(
+            "Use a natural, realistic, and visually restrained treatment."
+        )
+    if is_edit and options.input_fidelity == "high":
+        requirements.append(
+            "Strictly preserve identities, composition, geometry, and fine details from the input images except for changes explicitly requested."
+        )
+    if not requirements:
+        return prompt
+    return (
+        prompt.rstrip()
+        + "\n\nAdditional output requirements:\n- "
+        + "\n- ".join(requirements)
     )
 
 
@@ -365,8 +596,25 @@ def extract_generated_images(
     return images, revised_prompt
 
 
-def openai_image_response(response: Any, created: int) -> Dict[str, Any]:
+def openai_image_response(
+    response: Any,
+    created: int,
+    expected_mime_type: Optional[str] = None,
+) -> Dict[str, Any]:
     images, revised_prompt = extract_generated_images(response)
+    if expected_mime_type is not None:
+        mismatched = [
+            image.mime_type
+            for image in images
+            if image.mime_type.lower() != expected_mime_type.lower()
+        ]
+        if mismatched:
+            raise ImageProxyError(
+                502,
+                f"Vertex returned '{mismatched[0]}' instead of requested '{expected_mime_type}'.",
+                "upstream_error",
+                param="output_format",
+            )
     return {
         "created": created,
         "data": [
@@ -500,7 +748,7 @@ def openai_error_payload(error: ImageProxyError) -> Dict[str, Any]:
         "error": {
             "message": error.message,
             "type": error.error_type,
-            "param": None,
+            "param": error.param,
             "code": error.status_code,
         }
     }

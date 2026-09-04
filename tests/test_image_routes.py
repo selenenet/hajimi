@@ -19,9 +19,14 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"route-test"
 class FakeModels:
     def __init__(self):
         self.generate_calls = 0
+        self.last_kwargs = None
 
     async def generate_content(self, **kwargs):
         self.generate_calls += 1
+        self.last_kwargs = kwargs
+        image_config = kwargs["config"].image_config
+        output_options = image_config.image_output_options if image_config else None
+        mime_type = output_options.mime_type if output_options else "image/png"
         return types.GenerateContentResponse.model_validate(
             {
                 "candidates": [
@@ -32,7 +37,7 @@ class FakeModels:
                                 {"text": "Revised"},
                                 {
                                     "inlineData": {
-                                        "mimeType": "image/png",
+                                        "mimeType": mime_type,
                                         "data": PNG_BYTES,
                                     }
                                 },
@@ -112,6 +117,71 @@ class ImageRouteTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.models.generate_calls, 1)
+
+    def test_openai_edit_accepts_bracketed_image_field(self):
+        response = self.client.post(
+            "/v1/images/edits",
+            headers=self.headers,
+            data={"prompt": "Add a border"},
+            files=[("image[]", ("input.png", PNG_BYTES, "image/png"))],
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.models.generate_calls, 1)
+
+    def test_openai_generation_maps_quality_format_and_prompt_controls(self):
+        response = self.client.post(
+            "/v1/images/generations",
+            headers=self.headers,
+            json={
+                "prompt": "A blue square",
+                "quality": "low",
+                "output_format": "webp",
+                "output_compression": 75,
+                "background": "transparent",
+                "style": "vivid",
+                "moderation": "low",
+                "user": "must-not-be-forwarded",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        config = self.models.last_kwargs["config"]
+        self.assertEqual(config.image_config.image_size, "512")
+        self.assertEqual(
+            config.image_config.image_output_options.mime_type,
+            "image/webp",
+        )
+        self.assertEqual(
+            config.image_config.image_output_options.compression_quality,
+            75,
+        )
+        prompt = self.models.last_kwargs["contents"][0].parts[0].text
+        self.assertIn("transparent background", prompt)
+        self.assertIn("vivid", prompt)
+        self.assertNotIn("must-not-be-forwarded", repr(self.models.last_kwargs))
+
+    def test_openai_edit_rejects_mask(self):
+        response = self.client.post(
+            "/v1/images/edits",
+            headers=self.headers,
+            data={"prompt": "Add a border"},
+            files=[
+                ("image", ("input.png", PNG_BYTES, "image/png")),
+                ("mask", ("mask.png", PNG_BYTES, "image/png")),
+            ],
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["error"]["param"], "mask")
+        self.assertEqual(self.models.generate_calls, 0)
+
+    def test_openai_generation_rejects_streaming(self):
+        response = self.client.post(
+            "/v1/images/generations",
+            headers=self.headers,
+            json={"prompt": "A blue square", "stream": True},
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["error"]["param"], "stream")
+        self.assertEqual(self.models.generate_calls, 0)
 
     def test_rejects_multiple_candidates_before_upstream_call(self):
         response = self.client.post(
