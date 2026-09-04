@@ -290,11 +290,14 @@ def _base64_from_inline_data(data: Any) -> str:
         try:
             decoded = base64.b64decode(data, validate=True)
         except (binascii.Error, ValueError) as exc:
-            raise ImageProxyError(
-                502,
-                "Vertex returned malformed image data.",
-                "upstream_error",
-            ) from exc
+            try:
+                decoded = base64.b64decode(data, altchars=b"-_", validate=True)
+            except (binascii.Error, ValueError) as urlsafe_exc:
+                raise ImageProxyError(
+                    502,
+                    "Vertex returned malformed image data.",
+                    "upstream_error",
+                ) from urlsafe_exc
         return base64.b64encode(decoded).decode("ascii")
     raise ImageProxyError(
         502,
@@ -376,16 +379,35 @@ def openai_image_response(response: Any, created: int) -> Dict[str, Any]:
     }
 
 
+def _normalize_native_inline_data(value: Any) -> Any:
+    """Convert SDK URL-safe bytes encoding to Gemini's standard Base64 JSON."""
+    if isinstance(value, list):
+        return [_normalize_native_inline_data(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    normalized = {
+        key: _normalize_native_inline_data(item) for key, item in value.items()
+    }
+    for inline_key in ("inlineData", "inline_data"):
+        inline_data = normalized.get(inline_key)
+        if isinstance(inline_data, dict) and inline_data.get("data") is not None:
+            inline_data["data"] = _base64_from_inline_data(inline_data["data"])
+    return normalized
+
+
 def serialize_native_response(response: Any) -> Dict[str, Any]:
     if isinstance(response, dict):
-        return response
-    if hasattr(response, "model_dump"):
-        return response.model_dump(mode="json", by_alias=True, exclude_none=True)
-    raise ImageProxyError(
-        502,
-        "Vertex returned an unsupported response object.",
-        "upstream_error",
-    )
+        serialized = response
+    elif hasattr(response, "model_dump"):
+        serialized = response.model_dump(mode="json", by_alias=True, exclude_none=True)
+    else:
+        raise ImageProxyError(
+            502,
+            "Vertex returned an unsupported response object.",
+            "upstream_error",
+        )
+    return _normalize_native_inline_data(serialized)
 
 
 def prepare_native_request(

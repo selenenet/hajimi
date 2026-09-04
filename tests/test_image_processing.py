@@ -13,6 +13,7 @@ from app.vertex.image_processing import (
     normalize_image_model,
     prepare_native_request,
     resolve_image_options,
+    serialize_native_response,
     validate_input_image,
     validate_input_images,
 )
@@ -170,6 +171,35 @@ class ImageResponseTests(unittest.TestCase):
 
 
 class NativeImageRequestTests(unittest.TestCase):
+    def test_native_response_uses_standard_base64(self):
+        image_bytes = b"\xfb\xff\x00"
+        response = types.GenerateContentResponse.model_validate(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "role": "model",
+                            "parts": [
+                                {
+                                    "inlineData": {
+                                        "mimeType": "image/png",
+                                        "data": image_bytes,
+                                    }
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        )
+
+        serialized = serialize_native_response(response)
+        encoded = serialized["candidates"][0]["content"]["parts"][0][
+            "inlineData"
+        ]["data"]
+        self.assertEqual(encoded, base64.b64encode(image_bytes).decode("ascii"))
+        self.assertEqual(base64.b64decode(encoded, validate=True), image_bytes)
+
     def test_native_request_forces_text_and_image_modalities(self):
         payload = {
             "contents": [
