@@ -1,11 +1,13 @@
 import base64
 import unittest
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from google.genai import types
+from PIL import Image
 
 from app.api import routes as api_routes
 from app.api.routes import router
@@ -13,7 +15,13 @@ from app.config import settings
 from app.vertex.routes import images_api
 
 
-PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"route-test"
+def make_png_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGBA", (2, 2), (0, 128, 255, 128)).save(output, format="PNG")
+    return output.getvalue()
+
+
+PNG_BYTES = make_png_bytes()
 
 
 class FakeModels:
@@ -148,12 +156,12 @@ class ImageRouteTests(unittest.TestCase):
         self.assertEqual(config.image_config.image_size, "512")
         self.assertEqual(
             config.image_config.image_output_options.mime_type,
-            "image/webp",
+            "image/png",
         )
-        self.assertEqual(
-            config.image_config.image_output_options.compression_quality,
-            75,
-        )
+        self.assertIsNone(config.image_config.image_output_options.compression_quality)
+        webp = base64.b64decode(response.json()["data"][0]["b64_json"])
+        self.assertEqual(webp[:4], b"RIFF")
+        self.assertEqual(webp[8:12], b"WEBP")
         prompt = self.models.last_kwargs["contents"][0].parts[0].text
         self.assertIn("transparent background", prompt)
         self.assertIn("vivid", prompt)

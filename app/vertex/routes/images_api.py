@@ -142,7 +142,7 @@ async def generate_openai_image(
         result = openai_image_response(
             response,
             int(time.time()),
-            expected_mime_type=options.output_mime_type,
+            options=options,
         )
     except Exception as exc:
         error = map_upstream_exception(exc)

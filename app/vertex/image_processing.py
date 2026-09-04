@@ -6,9 +6,11 @@ import base64
 import binascii
 import re
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from google.genai import types
+from PIL import Image, UnidentifiedImageError
 
 from app.vertex.model_loader import OFFICIAL_VERTEX_IMAGE_MODELS
 
@@ -51,6 +53,15 @@ OUTPUT_FORMAT_MIME_TYPES = {
     "png": "image/png",
     "jpeg": "image/jpeg",
     "webp": "image/webp",
+}
+
+# Vertex Gemini image output currently accepts PNG and JPEG. WebP is accepted as
+# an input MIME type, but not by ImageConfig.imageOutputOptions. To preserve the
+# OpenAI-compatible WebP response, request a PNG once and transcode it in memory.
+VERTEX_OUTPUT_MIME_TYPES = {
+    "png": "image/png",
+    "jpeg": "image/jpeg",
+    "webp": "image/png",
 }
 
 QUALITY_IMAGE_SIZES = {
@@ -119,6 +130,7 @@ class ResolvedImageOptions:
     quality: str
     output_format: str
     output_mime_type: str
+    vertex_output_mime_type: str
     output_compression: Optional[int]
     background: str
     moderation: str
@@ -321,6 +333,7 @@ def resolve_image_options(
         quality=normalized_quality,
         output_format=normalized_output_format,
         output_mime_type=OUTPUT_FORMAT_MIME_TYPES[normalized_output_format],
+        vertex_output_mime_type=VERTEX_OUTPUT_MIME_TYPES[normalized_output_format],
         output_compression=output_compression,
         background=normalized_background,
         moderation=normalized_moderation,
@@ -365,8 +378,8 @@ def build_image_generation_config(
         partial_images=partial_images,
         mask_provided=mask_provided,
     )
-    output_options: Dict[str, Any] = {"mime_type": options.output_mime_type}
-    if options.output_compression is not None:
+    output_options: Dict[str, Any] = {"mime_type": options.vertex_output_mime_type}
+    if options.output_compression is not None and options.output_format == "jpeg":
         output_options["compression_quality"] = options.output_compression
     image_config: Dict[str, Any] = {"image_output_options": output_options}
     if options.aspect_ratio is not None:
@@ -600,21 +613,51 @@ def openai_image_response(
     response: Any,
     created: int,
     expected_mime_type: Optional[str] = None,
+    options: Optional[ResolvedImageOptions] = None,
 ) -> Dict[str, Any]:
     images, revised_prompt = extract_generated_images(response)
-    if expected_mime_type is not None:
+    upstream_mime_type = (
+        options.vertex_output_mime_type if options is not None else expected_mime_type
+    )
+    if upstream_mime_type is not None:
         mismatched = [
             image.mime_type
             for image in images
-            if image.mime_type.lower() != expected_mime_type.lower()
+            if image.mime_type.lower() != upstream_mime_type.lower()
         ]
         if mismatched:
             raise ImageProxyError(
                 502,
-                f"Vertex returned '{mismatched[0]}' instead of requested '{expected_mime_type}'.",
+                f"Vertex returned '{mismatched[0]}' instead of requested '{upstream_mime_type}'.",
                 "upstream_error",
                 param="output_format",
             )
+    if options is not None and options.output_format == "webp":
+        converted: List[GeneratedImage] = []
+        for image in images:
+            try:
+                source = base64.b64decode(image.b64_json, validate=True)
+                with Image.open(BytesIO(source)) as opened:
+                    opened.load()
+                    destination = BytesIO()
+                    save_options: Dict[str, Any] = {"format": "WEBP"}
+                    if options.output_compression is not None:
+                        save_options["quality"] = options.output_compression
+                    opened.save(destination, **save_options)
+            except (ValueError, OSError, UnidentifiedImageError) as exc:
+                raise ImageProxyError(
+                    502,
+                    "Failed to convert the Vertex image response to WebP.",
+                    "upstream_error",
+                    param="output_format",
+                ) from exc
+            converted.append(
+                GeneratedImage(
+                    b64_json=base64.b64encode(destination.getvalue()).decode("ascii"),
+                    mime_type="image/webp",
+                )
+            )
+        images = converted
     return {
         "created": created,
         "data": [

@@ -174,7 +174,8 @@ OpenAI 图片接口只返回 `b64_json`，不会为图片创建公开 URL 或持
 - `quality` 映射为输出分辨率：`low=512`、`medium/standard=1K`、
   `high/hd=2K`。目标模型不支持该分辨率时返回 400，不自动降级。
 - `output_format` 支持 `png`、`jpeg`、`webp`；`output_compression` 为
-  `0-100`，仅适用于 JPEG/WebP。
+  `0-100`，仅适用于 JPEG/WebP。Vertex 原生输出只支持 PNG/JPEG，因此
+  WebP 会在一次 Vertex 调用完成后于内存中转换，不写入服务器磁盘。
 - `background` 支持 `auto`、`transparent`、`opaque`，`style` 支持
   `vivid`、`natural`；这些值通过提示词近似实现，不是 Gemini 原生保证。
 - `moderation=auto/low` 均保留 Google 自身安全策略，不会降低上游过滤级别。

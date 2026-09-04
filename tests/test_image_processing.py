@@ -1,8 +1,10 @@
 import base64
 import unittest
+from io import BytesIO
 from types import SimpleNamespace
 
 from google.genai import types
+from PIL import Image
 
 from app.vertex.image_processing import (
     ImageProxyError,
@@ -21,7 +23,13 @@ from app.vertex.image_processing import (
 )
 
 
-PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"test-image"
+def make_png_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGBA", (2, 2), (0, 128, 255, 128)).save(output, format="PNG")
+    return output.getvalue()
+
+
+PNG_BYTES = make_png_bytes()
 
 
 class ImageModelValidationTests(unittest.TestCase):
@@ -108,6 +116,20 @@ class ImageModelValidationTests(unittest.TestCase):
             config.image_config.image_output_options.compression_quality,
             82,
         )
+
+    def test_webp_uses_png_upstream_without_forwarding_compression(self):
+        options, config = build_image_generation_config(
+            "[PAY]gemini-3.1-flash-image",
+            output_format="webp",
+            output_compression=61,
+        )
+        self.assertEqual(options.output_mime_type, "image/webp")
+        self.assertEqual(options.vertex_output_mime_type, "image/png")
+        self.assertEqual(
+            config.image_config.image_output_options.mime_type,
+            "image/png",
+        )
+        self.assertIsNone(config.image_config.image_output_options.compression_quality)
 
     def test_rejects_invalid_openai_controls_with_parameter_name(self):
         cases = [
@@ -257,6 +279,34 @@ class ImageResponseTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.status_code, 502)
         self.assertEqual(raised.exception.param, "output_format")
+
+    def test_converts_png_response_to_webp_in_memory(self):
+        response = SimpleNamespace(
+            candidates=[
+                SimpleNamespace(
+                    content=types.Content(
+                        role="model",
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=PNG_BYTES,
+                                    mime_type="image/png",
+                                )
+                            )
+                        ],
+                    )
+                )
+            ]
+        )
+        options = resolve_image_options(
+            "[PAY]gemini-3.1-flash-image",
+            output_format="webp",
+            output_compression=61,
+        )
+        result = openai_image_response(response, created=0, options=options)
+        converted = base64.b64decode(result["data"][0]["b64_json"], validate=True)
+        self.assertEqual(converted[:4], b"RIFF")
+        self.assertEqual(converted[8:12], b"WEBP")
 
     def test_surfaces_safety_block(self):
         response = SimpleNamespace(

@@ -12,3 +12,4 @@ python-multipart==0.0.20
 google-genai==2.6.0
 xxhash
 openai==1.76.0
+pillow==11.3.0
