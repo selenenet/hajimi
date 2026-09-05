@@ -26,6 +26,7 @@ import sys
 import pathlib
 import os
 import webbrowser
+import traceback
 
 # 设置模板目录
 BASE_DIR = pathlib.Path(__file__).parent
@@ -150,7 +151,9 @@ async def startup_event():
     app.state.credential_manager = credential_manager_instance
 
     # 初始化Vertex AI服务
-    await init_vertex_ai(credential_manager=credential_manager_instance)
+    vertex_initialized = await init_vertex_ai(
+        credential_manager=credential_manager_instance
+    )
     schedule_cache_cleanup(response_cache_manager, active_requests_manager)
     # 检查版本
     await check_version()
@@ -178,7 +181,14 @@ async def startup_event():
             initial_invalid_keys.append(key)
 
     if not first_valid_key:
-        log("error", "启动时未能找到任何有效 API 密钥！")
+        if settings.ENABLE_VERTEX and (
+            vertex_initialized or settings.VERTEX_EXPRESS_API_KEY.strip()
+        ):
+            log("info", "已加载 Vertex 凭据；未配置有效 AI Studio API Key，仅 AI Studio 接口不可用。")
+        elif settings.ENABLE_VERTEX:
+            log("warning", "未加载 Vertex 凭据，且未配置有效 AI Studio API Key，请检查上游认证配置。")
+        else:
+            log("error", "AI Studio 模式下未找到有效 API Key，请检查 GEMINI_API_KEYS。")
         keys_to_check_later = []  # 没有有效key，无需后台检查
     else:
         # 使用第一个有效密钥加载模型
@@ -257,16 +267,23 @@ async def startup_event():
 async def global_exception_handler(request: Request, exc: Exception):
     from app.utils import translate_error
 
-    error_message = translate_error(str(exc))
-    extra_log_unhandled_exception = {"status_code": 500, "error_message": error_message}
+    error_type = type(exc).__name__
+    error_message = translate_error(str(exc)) or error_type
+    route = getattr(request.scope.get("route"), "path", "<unmatched>")
+    # Record locations, not request bodies, credentials, or exception payloads.
+    stack = " -> ".join(
+        f"{pathlib.Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+        for frame in traceback.extract_tb(exc.__traceback__)
+    )
+    extra_log_unhandled_exception = {"status_code": 500, "error_message": error_type}
     log(
         "error",
-        f"Unhandled exception: {error_message}",
+        f"Unhandled {error_type}: {request.method} {route}; stack={stack}",
         extra=extra_log_unhandled_exception,
     )
     return JSONResponse(
         status_code=500,
-        content=ErrorResponse(message=str(exc), type="internal_error").dict(),
+        content=ErrorResponse(message=error_message, type="internal_error").dict(),
     )
 
 

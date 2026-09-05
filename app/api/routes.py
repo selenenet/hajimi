@@ -384,10 +384,11 @@ async def vertex_chat_completions(
         function_call=request.function_call,
     )
 
-    # 调用vertex/routes/chat_api的实现
-    assert current_api_key is not None
+    # Client authentication has already run via custom_verify_password.
+    # Vertex selects its own SA/Express credentials; current_api_key belongs
+    # to AI Studio and can legitimately be None in a Vertex-only deployment.
     return await chat_api.chat_completions(
-        http_request, vertex_request, current_api_key
+        http_request, vertex_request, api_key=""
     )
 
 
